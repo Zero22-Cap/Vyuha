@@ -1,0 +1,13 @@
+# built programs and objects
+*.exe
+*.o
+__pycache__/
+pgo/
+
+# training checkpoints (the final net is kept at the top level as vyuha.nnue)
+nets/
+
+# match logs and local match configuration
+matches/
+config.json
+

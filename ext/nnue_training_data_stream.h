@@ -1,0 +1,273 @@
+#ifndef _SFEN_STREAM_H_
+#define _SFEN_STREAM_H_
+
+#include "parallel_dataloader.h"
+
+#include <optional>
+#include <fstream>
+#include <string>
+#include <memory>
+#include <vector>
+#include <functional>
+#include <atomic>
+#include <mutex>
+
+namespace training_data {
+
+    using namespace binpack;
+
+    static bool ends_with(const std::string& lhs, const std::string& end)
+    {
+        if (end.size() > lhs.size()) return false;
+
+        return std::equal(end.rbegin(), end.rend(), lhs.rbegin());
+    }
+
+    static bool has_extension(const std::string& filename, const std::string& extension)
+    {
+        return ends_with(filename, "." + extension);
+    }
+
+    struct BasicSfenInputStream
+    {
+        virtual std::optional<TrainingDataEntry> next() = 0;
+        virtual void fill(std::vector<TrainingDataEntry>& vec, std::size_t n)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                auto v = this->next();
+                if (!v.has_value())
+                {
+                    break;
+                }
+                vec.emplace_back(*v);
+            }
+        }
+        virtual void fill_threadsafe(std::vector<TrainingDataEntry>& vec, std::size_t n)
+        {
+            std::lock_guard<std::mutex> lock(fill_lock);
+            this->fill(vec, n);
+        }
+
+        virtual bool eof() const = 0;
+        virtual ~BasicSfenInputStream() {}
+
+    private:
+        std::mutex fill_lock;
+    };
+
+    struct BinSfenInputStream : BasicSfenInputStream
+    {
+        static constexpr auto openmode = std::ios::in | std::ios::binary;
+        static inline const std::string extension = "bin";
+
+        BinSfenInputStream(std::string filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, nnue::UniquePositionCounter* counter = nullptr) :
+            m_stream(filename, openmode),
+            m_filename(filename),
+            m_eof(!m_stream),
+            m_cyclic(cyclic),
+            m_skipPredicate(std::move(skipPredicate)),
+            m_counter(counter)
+        {
+        }
+
+        std::optional<TrainingDataEntry> next() override
+        {
+            nodchip::PackedSfenValue e;
+            bool reopenedFileOnce = false;
+            for(;;)
+            {
+                if(m_stream.read(reinterpret_cast<char*>(&e), sizeof(nodchip::PackedSfenValue)))
+                {
+                    auto entry = packedSfenValueToTrainingDataEntry(e);
+                    if (m_counter) m_counter->addPreskip(1);
+                    if (!m_skipPredicate || !m_skipPredicate(entry))
+                    {
+                        if (m_counter) m_counter->add(nnue::hash::hash(entry.pos));
+                        return entry;
+                    }
+                }
+                else
+                {
+                    if (m_cyclic)
+                    {
+                        if (reopenedFileOnce)
+                            return std::nullopt;
+
+                        m_stream = std::fstream(m_filename, openmode);
+                        reopenedFileOnce = true;
+                        if (!m_stream)
+                            return std::nullopt;
+
+                        continue;
+                    }
+
+                    m_eof.store(true, std::memory_order_release);
+                    return std::nullopt;
+                }
+            }
+        }
+
+        bool eof() const override
+        {
+            return m_eof.load();
+        }
+
+        ~BinSfenInputStream() override {}
+
+    private:
+        std::fstream m_stream;
+        std::string m_filename;
+        std::atomic<bool> m_eof;
+        bool m_cyclic;
+        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+        nnue::UniquePositionCounter* m_counter = nullptr;
+    };
+
+    struct BinpackSfenInputStream : BasicSfenInputStream
+    {
+        static constexpr auto openmode = std::ios::in | std::ios::binary;
+        static inline const std::string extension = "binpack";
+
+        BinpackSfenInputStream(std::string filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, nnue::UniquePositionCounter* counter = nullptr) :
+            m_stream(std::make_unique<binpack::CompressedTrainingDataEntryReader>(filename, openmode)),
+            m_filename(filename),
+            m_eof(!m_stream->hasNext()),
+            m_cyclic(cyclic),
+            m_skipPredicate(std::move(skipPredicate)),
+            m_counter(counter)
+        {
+        }
+
+        std::optional<TrainingDataEntry> next() override
+        {
+            bool reopenedFileOnce = false;
+            for(;;)
+            {
+                if (!m_stream->hasNext())
+                {
+                    if (m_cyclic)
+                    {
+                        if (reopenedFileOnce)
+                            return std::nullopt;
+
+                        m_stream = std::make_unique<binpack::CompressedTrainingDataEntryReader>(m_filename, openmode);
+                        reopenedFileOnce = true;
+
+                        if (!m_stream->hasNext())
+                            return std::nullopt;
+
+                        continue;
+                    }
+
+                    m_eof.store(true, std::memory_order_release);
+                    return std::nullopt;
+                }
+
+                auto e = m_stream->next();
+                if (m_counter) m_counter->addPreskip(1);
+                if (!m_skipPredicate || !m_skipPredicate(e))
+                {
+                    if (m_counter) m_counter->add(nnue::hash::hash(e.pos));
+                    return e;
+                }
+            }
+        }
+
+        bool eof() const override
+        {
+            return m_eof.load();
+        }
+
+        ~BinpackSfenInputStream() override {}
+
+    private:
+        std::unique_ptr<binpack::CompressedTrainingDataEntryReader> m_stream;
+        std::string m_filename;
+        std::atomic<bool> m_eof;
+        bool m_cyclic;
+        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+        nnue::UniquePositionCounter* m_counter = nullptr;
+    };
+
+    struct BinpackSfenInputParallelStream : BasicSfenInputStream
+    {
+        static constexpr auto openmode = std::ios::in | std::ios::binary;
+        static inline const std::string extension = "binpack";
+
+        BinpackSfenInputParallelStream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, nnue::UniquePositionCounter* counter = nullptr, int rank = 0, int world_size = 1) :
+            m_stream(std::make_unique<binpack::CompressedTrainingDataEntryParallelReader>(concurrency, filenames, openmode, cyclic, skipPredicate, counter, rank, world_size)),
+            m_filenames(filenames),
+            m_eof(false),
+            m_concurrency(concurrency),
+            m_cyclic(cyclic),
+            m_skipPredicate(skipPredicate)
+        {
+        }
+
+        std::optional<TrainingDataEntry> next() override
+        {
+            // filtering is done a layer deeper.
+            auto v = m_stream->next();
+            if (!v.has_value())
+            {
+                m_eof.store(true, std::memory_order_release);
+                return std::nullopt;
+            }
+
+            return v;
+        }
+
+        void fill(std::vector<TrainingDataEntry>& v, std::size_t n) override
+        {
+            fill_threadsafe(v, n);
+        }
+
+        void fill_threadsafe(std::vector<TrainingDataEntry>& v, std::size_t n) override
+        {
+            std::size_t k = static_cast<size_t>(m_stream->fill(v, n));
+            if (n != k)
+            {
+                m_eof.store(true, std::memory_order_release);
+            }
+        }
+
+        bool eof() const override
+        {
+            return m_eof.load();
+        }
+
+        ~BinpackSfenInputParallelStream() override {}
+
+    private:
+        std::unique_ptr<binpack::CompressedTrainingDataEntryParallelReader> m_stream;
+        std::vector<std::string> m_filenames;
+        std::atomic<bool> m_eof;
+        int m_concurrency;
+        bool m_cyclic;
+        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+    };
+
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, nnue::UniquePositionCounter* counter = nullptr)
+    {
+        if (has_extension(filename, BinSfenInputStream::extension))
+            return std::make_unique<BinSfenInputStream>(filename, cyclic, std::move(skipPredicate), counter);
+        else if (has_extension(filename, BinpackSfenInputStream::extension))
+            return std::make_unique<BinpackSfenInputStream>(filename, cyclic, std::move(skipPredicate), counter);
+
+        return nullptr;
+    }
+
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, nnue::UniquePositionCounter* counter = nullptr, int rank = 0, int world_size = 1)
+    {
+        // TODO (low priority): optimize and parallelize .bin reading.
+        if (has_extension(filenames[0], BinSfenInputStream::extension))
+            return std::make_unique<BinSfenInputStream>(filenames[0], cyclic, std::move(skipPredicate), counter);
+        else if (has_extension(filenames[0], BinpackSfenInputParallelStream::extension))
+            return std::make_unique<BinpackSfenInputParallelStream>(concurrency, filenames, cyclic, std::move(skipPredicate), counter, rank, world_size);
+
+        return nullptr;
+    }
+}
+
+#endif
